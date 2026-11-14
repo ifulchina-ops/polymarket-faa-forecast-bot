@@ -38,13 +38,18 @@ momentum was tested on the practice and hurt, so no drift is used):
    interpolated in sqrt(horizon); below the first anchor the quantiles
    shrink by sqrt(h/anchor). Captures how moves really grow with horizon.
 
-Two small calibration steps on the blend: the inner (25%/75%) quantiles
-are pulled 15% toward the median (averaging three forecasters widens the
-middle of the distribution), and the outer quantiles are left as the blend
-gives them (extra tail width was tested and cost more than it bought -
-the empirical shapes already widen per-market from each market's own jump
-history). A market that fails any step falls back to the house persistence
-baseline rather than failing the whole case.
+Two small calibration steps on the blend. First, the normal component's
+sigma averages the EWMA standard deviation with a MAD-based (L1) EWMA
+sigma, which is robust to single jumps. Second, the inner (25%/75%)
+quantiles are pulled toward the median by an amount that ramps with the
+market's price level - 0.70x at price 0 up to 1.00x (no shrink) at price
+0.10 and above: the optimal shrink rises monotonically with price across
+buckets, because the blend's middle-widening is a low-price clamping
+artifact that reverses at mid prices. The outer quantiles are left as
+the blend gives them (extra tail width was tested and cost more than it
+bought - the empirical shapes already widen per-market from each market's
+own jump history). A market that fails any step falls back to the house
+persistence baseline rather than failing the whole case.
 
 ## Backtest
 
@@ -54,12 +59,15 @@ next case file (p00-p04) and Polymarket's CLOB price history (p05):
 | forecaster | mean pinball loss |
 |---|---|
 | House baseline (sigma 0.0025) | 0.3636 |
-| This entry (blend) | **0.2638** |
+| This entry (blend + level-ramped inner shrink + MAD-mix sigma) | **0.2622** |
 
 The baseline figure reproduces the kit's published 0.363589 exactly,
 which validates the backtest's outcomes. The blend beats the baseline on
-every practice case (0.473 / 0.300 / 0.330 / 0.240 / 0.197 / 0.106), and
-its 90% interval covers 0.89 of practice minutes (nominal 0.90).
+every practice case (0.466 / 0.298 / 0.335 / 0.238 / 0.195 / 0.105), and
+its 90% interval covers 0.89 of practice minutes (nominal 0.90). The
+refinements were validated on random 4-market subsets matching the
+final's structure (mean delta -0.0015 vs the fixed-shrink version, wins
+9/10 seeds) and on mid-price markets only (mean delta -0.0080).
 
 Sensitivity, all on the same six cases: EWMA half-life 60 instead of 20
 gives 0.2740; a 24-hour lookback instead of 6 hours gives 0.2710; tail
