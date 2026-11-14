@@ -32,10 +32,19 @@ tested on the practice and hurt, so no drift is used):
    than a random walk when prices mean-revert, faster when they jump.
 
 Backtested on the six public practice cases, the blend's mean pinball loss
-is 0.2638 points, against 0.3636 for the house persistence baseline
+is 0.2622 points, against 0.3636 for the house persistence baseline
 (the baseline figure reproduces the kit's published 0.363589 exactly,
 which validates the backtest harness's outcomes). The 90% interval covers
 0.89 of practice minutes (nominal 0.90).
+
+Two refinements over the plain blend (validated 14 Nov, Push 5):
+- The normal component's sigma is the MEAN of the EWMA standard deviation
+  and a MAD-based (L1) EWMA sigma, which is robust to single jumps.
+- The inner-quantile shrink RAMPS WITH THE PRICE LEVEL (0.70 at price 0
+  to 1.00 at price >= 0.10): the optimal shrink rises monotonically with
+  price across buckets (0.70 best below 0.02, 1.00 best above 0.10), so a
+  fixed shrink is too loose on near-zero markets and too tight on the
+  mid-price markets the final actually scores.
 
 Everything is deterministic (no randomness, no clock, no network),
 standard library only, and runs in well under a second per case.
@@ -90,13 +99,18 @@ BASELINE_SIGMA = 0.0025
 # multiplier stays 1.0.
 TAIL_WIDE = 1.0
 # Shrinkage of the inner (25%/75%) quantiles toward the median, as a
-# multiplier. Averaging three forecasters' quantiles widens the middle of
-# the distribution (the unshrunk blend's 50% interval covers 0.66 of
-# practice minutes, not 0.50), so the inner quantiles are pulled in a
-# little; 0.85 is near the optimum of a smooth curve on the practice
-# (0.85 -> 0.2638, 0.70 -> 0.2644, 0.60 -> 0.2657) and improves or ties
-# on 5 of the 6 cases.
-INNER_SHRINK = 0.85
+# multiplier that RAMPS WITH THE PRICE LEVEL. Averaging three forecasters'
+# quantiles widens the middle of the distribution (the unshrunk blend's 50%
+# interval covers 0.66 of practice minutes, not 0.50), so the inner
+# quantiles are pulled in - but the optimal pull depends on price: scored
+# per price bucket, 0.70 wins below 0.02, 0.85 wins at 0.05-0.10 and 1.00
+# wins above 0.10 (the widening is a low-price clamping artifact and
+# reverses at mid prices). The shrink therefore ramps linearly from
+# INNER_SHRINK_LO at price 0 to INNER_SHRINK_HI at price
+# INNER_SHRINK_PRICE_HI and stays flat above it.
+INNER_SHRINK_LO = 0.70
+INNER_SHRINK_HI = 1.0
+INNER_SHRINK_PRICE_HI = 0.10
 
 
 def clamp6(x):
@@ -148,6 +162,31 @@ def ewma_vol(prices):
     if wsum <= 0 or m2 <= 0:
         return SIGMA_FLOOR
     return min(SIGMA_CAP, max(SIGMA_FLOOR, math.sqrt(m2 / wsum)))
+
+
+def mad_vol(prices):
+    """Exponentially weighted MAD (mean absolute 1-min change) sigma.
+
+    Same 20-minute half-life as ewma_vol, but L1-based: E|N(0, s)| =
+    s*sqrt(2/pi), so s = MAD * sqrt(pi/2). A single jump inflates a
+    squared (L2) estimate far more than an L1 one, so the MAD sigma is a
+    robust second opinion; forecast_market averages the two.
+    """
+    n = len(prices)
+    if n < 20:
+        return None
+    lam = 0.5 ** (1.0 / EWMA_HALFLIFE)
+    start = max(1, n - int(6 * EWMA_HALFLIFE))
+    wsum = 0.0
+    m = 0.0
+    for i in range(start, n):
+        d = abs(prices[i] - prices[i - 1])
+        w = lam ** (n - 1 - i)
+        wsum += w
+        m += w / wsum * (d - m)
+    if wsum <= 0 or m <= 0:
+        return SIGMA_FLOOR
+    return min(SIGMA_CAP, max(SIGMA_FLOOR, m * math.sqrt(math.pi / 2.0)))
 
 
 def normal_rows(x, sigma, horizon):
@@ -225,22 +264,24 @@ def horizon_rows(prices, horizon):
     return rows
 
 
-def shrink_inner(rows):
-    """Pull the inner (25%/75%) quantiles toward the median by INNER_SHRINK.
+def shrink_inner(rows, shrink):
+    """Pull the inner (25%/75%) quantiles toward the median by `shrink`.
 
     Averaging three forecasters' quantiles widens the middle of the
     distribution, so the inner quantiles are shrunk a little to restore
-    calibration (see the INNER_SHRINK comment).
+    calibration. The shrink amount ramps with the market's price level
+    (see INNER_SHRINK_LO/HI); it is computed per market in
+    forecast_market and passed in here.
     """
-    if INNER_SHRINK == 1.0:
+    if shrink == 1.0:
         return rows
     mid = QUANTILES.index(0.5)
     out = []
     for row in rows:
         m = row[mid]
         new = list(row)
-        new[1] = clamp6(m + (row[1] - m) * INNER_SHRINK)
-        new[3] = clamp6(m + (row[3] - m) * INNER_SHRINK)
+        new[1] = clamp6(m + (row[1] - m) * shrink)
+        new[3] = clamp6(m + (row[3] - m) * shrink)
         out.append(enforce_order(new))
     return out
 
@@ -261,11 +302,21 @@ def widen_tails(rows):
 
 
 def forecast_market(prices, horizon):
-    """Equal-thirds blend of the three quantile forecasters."""
+    """Equal-thirds blend of the three quantile forecasters.
+
+    The normal component's sigma averages the EWMA standard deviation
+    with the robust MAD sigma, and the inner shrink ramps with the
+    market's last price (tighter on near-zero markets, none at mid
+    prices and above).
+    """
     x = prices[-1]
     sig = ewma_vol(prices)
+    mad = mad_vol(prices)
     if sig is None:
         sig = BASELINE_SIGMA
+    if mad is None:
+        mad = BASELINE_SIGMA
+    sig = 0.5 * (sig + mad)
     a = normal_rows(x, sig, horizon)
     b = onemin_rows(prices, horizon)
     c = horizon_rows(prices, horizon)
@@ -274,7 +325,9 @@ def forecast_market(prices, horizon):
         row = [clamp6((a[h][k] + b[h][k] + c[h][k]) / 3.0)
                for k in range(len(QUANTILES))]
         rows.append(enforce_order(row))
-    return widen_tails(shrink_inner(rows))
+    shrink = INNER_SHRINK_LO + (INNER_SHRINK_HI - INNER_SHRINK_LO) * min(
+        1.0, x / INNER_SHRINK_PRICE_HI)
+    return widen_tails(shrink_inner(rows, shrink))
 
 
 def forecast_case(case):
